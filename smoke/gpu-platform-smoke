@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+test -c /dev/nvidiactl
+test -c /dev/nvidia0
+/usr/bin/nvidia-smi --query-gpu=index,name,driver_version --format=csv,noheader
+/usr/bin/python3 - <<'PY'
+import ctypes
+
+ctypes.CDLL("libcuda.so.1")
+print("libcuda.so.1: loadable")
+PY

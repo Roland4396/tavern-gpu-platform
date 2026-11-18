@@ -1,0 +1,249 @@
+---
+- name: Import and activate an exact signed GPU stack release
+  hosts: gpu_nodes
+  serial: 1
+  gather_facts: false
+  vars:
+    nix_bin: /home/worker/.nix-profile/bin/nix
+    cache_uri: file:///mnt/data/worker/.runtime/nix-cache?compression=zstd&compression-level=1&parallel-compression=true
+    profile_root: /home/worker/.local/profiles/gpu-runtime
+    agent_socket: /home/worker/.local/state/gpu-runtime/agent.sock
+    supervisorctl: /etc/dsw/runtime/bin/supervisorctl
+    supervisor_config: /etc/dsw/sys_configs/supervisor.conf
+  pre_tasks:
+    - name: Require explicit immutable store paths
+      ansible.builtin.assert:
+        that:
+          - gpu_stack_profiles is defined
+          - gpu_stack_profiles is mapping
+          - '"profile-assets" in gpu_stack_profiles'
+          - 'gpu_stack_profiles | length >= 3'
+
+    - name: Read node activity without waking a workload
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --fail
+          - --silent
+          - --show-error
+          - --unix-socket
+          - "{{ agent_socket }}"
+          - http://localhost/status
+      register: node_status_raw
+      changed_when: false
+
+    - name: Decode node activity
+      ansible.builtin.set_fact:
+        node_status: "{{ node_status_raw.stdout | from_json }}"
+
+    - name: Refuse to switch profiles over active work
+      ansible.builtin.assert:
+        that:
+          - >-
+            node_status.workloads.values()
+            | rejectattr('status', 'equalto', 'stopped')
+            | list | length == 0
+        fail_msg: Node has an active managed workload; no profile was changed.
+
+  tasks:
+    - name: Import exact closures from the signed private cache
+      ansible.builtin.command:
+        argv:
+          - "{{ nix_bin }}"
+          - copy
+          - --from
+          - "{{ cache_uri }}"
+          - "{{ item.value }}"
+      loop: "{{ gpu_stack_profiles | dict2items }}"
+      changed_when: true
+
+    - name: Verify each closure has a trusted signature
+      ansible.builtin.command:
+        argv:
+          - "{{ nix_bin }}"
+          - store
+          - verify
+          - --no-contents
+          - --sigs-needed
+          - "1"
+          - "{{ item.value }}"
+      loop: "{{ gpu_stack_profiles | dict2items }}"
+      changed_when: false
+
+    - name: Create the profile controller directory
+      ansible.builtin.file:
+        path: /home/worker/.local/libexec/gpu-platform
+        state: directory
+        owner: worker
+        group: worker
+        mode: "0700"
+
+    - name: Install the transactional profile activator
+      ansible.builtin.copy:
+        src: ../activate_profiles.py
+        dest: /home/worker/.local/libexec/gpu-platform/activate_profiles.py
+        owner: worker
+        group: worker
+        mode: "0700"
+
+    - name: Install the node configuration activator
+      ansible.builtin.copy:
+        src: ../activate_node_config.py
+        dest: /home/worker/.local/libexec/gpu-platform/activate_node_config.py
+        owner: worker
+        group: worker
+        mode: "0700"
+      register: config_activator
+
+    - name: Install the model artifact manager and catalog
+      ansible.builtin.copy:
+        src: "../{{ item }}"
+        dest: "/home/worker/.local/libexec/gpu-platform/{{ item }}"
+        owner: worker
+        group: worker
+        mode: "0700"
+      loop:
+        - artifact_sync.py
+        - artifacts.json
+
+    - name: Download, verify, and link declared model assets
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /home/worker/.local/libexec/gpu-platform/artifact_sync.py
+          - --catalog
+          - /home/worker/.local/libexec/gpu-platform/artifacts.json
+      register: artifact_sync
+      changed_when: "'\"changed\": true' in artifact_sync.stdout"
+
+    - name: Install the unified node-agent implementation
+      ansible.builtin.copy:
+        src: ../../remote/node_agent.py
+        dest: /home/worker/.local/libexec/gpu-runtime/node_agent.py
+        owner: worker
+        group: worker
+        mode: "0700"
+      register: node_agent_code
+      notify: Restart GPU node agent
+
+    - name: Install the Graph state lifecycle implementation
+      ansible.builtin.copy:
+        src: ../../remote/graph_state_sync.py
+        dest: /home/worker/.local/libexec/gpu-runtime/graph_state_sync.py
+        owner: worker
+        group: worker
+        mode: "0700"
+
+    - name: Install the managed GLM launcher and forced-reasoning template
+      ansible.builtin.copy:
+        src: "../../remote/{{ item.src }}"
+        dest: "/home/worker/.local/libexec/gpu-runtime/{{ item.dest }}"
+        owner: worker
+        group: worker
+        mode: "{{ item.mode }}"
+      loop:
+        - {src: glm_launcher.py, dest: glm_launcher.py, mode: "0700"}
+        - {src: glm_chat_template_max.jinja, dest: glm_chat_template_max.jinja, mode: "0600"}
+        - {src: configure_glm_node.py, dest: configure_glm_node.py, mode: "0700"}
+
+    - name: Install the managed Qwen3.8 launcher and node configurator
+      ansible.builtin.copy:
+        src: "../../remote/{{ item }}"
+        dest: "/home/worker/.local/libexec/gpu-runtime/{{ item }}"
+        owner: worker
+        group: worker
+        mode: "0700"
+      loop:
+        - qwen38_launcher.py
+        - configure_qwen38_node.py
+
+    - name: Add both managed Qwen3.8 context workloads to the node contract
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /home/worker/.local/libexec/gpu-runtime/configure_qwen38_node.py
+          - --config
+          - /home/worker/.config/gpu-runtime/node.json
+      register: qwen38_config_activation
+      changed_when: "'\"changed\": true' in qwen38_config_activation.stdout"
+      notify: Restart GPU node agent
+
+    - name: Stage the exact profile map
+      ansible.builtin.copy:
+        content: "{{ gpu_stack_profiles | to_nice_json }}\n"
+        dest: /home/worker/.local/libexec/gpu-platform/profiles.json
+        owner: worker
+        group: worker
+        mode: "0600"
+
+    - name: Atomically activate the complete profile map
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /home/worker/.local/libexec/gpu-platform/activate_profiles.py
+          - --root
+          - "{{ profile_root }}"
+          - activate
+          - --profiles-json
+          - /home/worker/.local/libexec/gpu-platform/profiles.json
+      changed_when: true
+
+    - name: Stage the stack contract in the active contract profile
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /home/worker/.local/libexec/gpu-platform/activate_node_config.py
+          - --config
+          - /home/worker/.config/gpu-runtime/node.json
+          - --stack
+          - "{{ profile_root }}/contract/current/share/gpu-runtime/stack.json"
+          - --profile-root
+          - "{{ profile_root }}"
+      register: config_activation
+      changed_when: "'\"changed\": true' in config_activation.stdout"
+      notify: Restart GPU node agent
+
+    - name: Keep GLM on the managed launcher with forced maximum reasoning
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /home/worker/.local/libexec/gpu-runtime/configure_glm_node.py
+          - --config
+          - /home/worker/.config/gpu-runtime/node.json
+      register: glm_config_activation
+      changed_when: "'\"changed\": true' in glm_config_activation.stdout"
+      notify: Restart GPU node agent
+
+  post_tasks:
+    - name: Verify model assets remained converged
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /home/worker/.local/libexec/gpu-platform/artifact_sync.py
+          - --catalog
+          - /home/worker/.local/libexec/gpu-platform/artifacts.json
+          - --check
+      changed_when: false
+
+    - name: Verify node-agent control plane remained healthy
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --fail
+          - --silent
+          - --show-error
+          - --unix-socket
+          - "{{ agent_socket }}"
+          - http://localhost/health
+      changed_when: false
+
+  handlers:
+    - name: Restart GPU node agent
+      ansible.builtin.command:
+        argv:
+          - "{{ supervisorctl }}"
+          - -c
+          - "{{ supervisor_config }}"
+          - restart
+          - gpu-node-agent
+      become: true

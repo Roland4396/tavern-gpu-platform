@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/../share/gpu-runtime" && pwd)
+exec /usr/bin/python3 "$root/profile_guard.py" --stack "$root/stack.json" @WORKLOAD@ "$@"

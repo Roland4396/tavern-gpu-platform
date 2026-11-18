@@ -1,0 +1,7 @@
+all:
+  children:
+    gpu_nodes:
+      hosts:
+        demo-node:
+          ansible_host: gpu.example.invalid
+          ansible_user: worker

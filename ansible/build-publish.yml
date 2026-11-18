@@ -1,0 +1,144 @@
+---
+- name: Build and publish every independent GPU platform profile
+  hosts: gpu-a
+  gather_facts: false
+  vars:
+    nix_bin: /home/worker/.nix-profile/bin/nix
+    source_root: /home/worker/.local/src/gpu-runtime
+    flake_path: "{{ source_root }}/platform"
+    cache_uri: file:///mnt/data/worker/.runtime/nix-cache?compression=zstd&compression-level=1&parallel-compression=true
+    cache_secret_key: /home/worker/.config/nix/gpu-platform-cache.sec
+    catalog_path: "{{ flake_path }}/catalog.json"
+    components_path: "{{ flake_path }}/components.json"
+    components_state_path: /home/worker/.local/state/gpu-runtime/releases/components.json
+    profiles:
+      - contract
+      - profile-glm
+      - profile-deepseek
+      - profile-qwen38_native
+      - profile-qwen38_yarn
+      - profile-graph
+      - profile-tts
+      - profile-h3
+      - profile-h3_ref
+      - profile-seedvr3
+      - profile-assets
+  tasks:
+    - name: Stage our GPU platform source tree
+      ansible.builtin.copy:
+        src: ../../
+        dest: "{{ source_root }}"
+        owner: worker
+        group: worker
+        mode: preserve
+
+    - name: Require the private signing key only on the builder
+      ansible.builtin.stat:
+        path: "{{ cache_secret_key }}"
+      register: signing_key
+
+    - name: Refuse an unsigned cache publication
+      ansible.builtin.assert:
+        that:
+          - signing_key.stat.exists
+          - signing_key.stat.mode == "0600"
+
+    - name: Install the ownership-bounded inventory and component builder
+      ansible.builtin.copy:
+        src: "../{{ item }}"
+        dest: "/home/worker/.local/libexec/gpu-platform/{{ item }}"
+        owner: worker
+        group: worker
+        mode: "0700"
+      loop:
+        - inventory.py
+        - build_components.py
+
+    - name: Generate the service-closure catalog on the builder
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /home/worker/.local/libexec/gpu-platform/inventory.py
+          - --config
+          - /home/worker/.config/gpu-runtime/node.json
+          - --stack
+          - "{{ flake_path }}/stack.json"
+          - --output
+          - "{{ catalog_path }}"
+      changed_when: true
+
+    - name: Build and sign every owned runtime component
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /home/worker/.local/libexec/gpu-platform/build_components.py
+          - --release-id
+          - "{{ gpu_stack_release_id }}"
+          - --catalog
+          - "{{ catalog_path }}"
+          - --output
+          - "{{ components_state_path }}"
+          - --signing-key
+          - "{{ cache_secret_key }}"
+          - --cache-uri
+          - "{{ cache_uri }}"
+      environment:
+        PATH: /home/worker/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin
+      changed_when: true
+
+    - name: Stage the exact component coordinates beside the flake
+      ansible.builtin.copy:
+        src: "{{ components_state_path }}"
+        dest: "{{ components_path }}"
+        remote_src: true
+        owner: worker
+        group: worker
+        mode: "0600"
+
+    - name: Evaluate and build all flake checks
+      ansible.builtin.command:
+        argv: ["{{ nix_bin }}", flake, check, --impure, "{{ flake_path }}"]
+      environment:
+        PATH: /home/worker/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin
+      changed_when: true
+
+    - name: Resolve exact profile store paths
+      ansible.builtin.command:
+        argv:
+          - "{{ nix_bin }}"
+          - build
+          - --impure
+          - --no-link
+          - --print-out-paths
+          - "{{ flake_path }}#{{ item }}"
+      loop: "{{ profiles }}"
+      register: built_profiles
+      changed_when: false
+
+    - name: Sign every profile closure
+      ansible.builtin.command:
+        argv:
+          - "{{ nix_bin }}"
+          - store
+          - sign
+          - --key-file
+          - "{{ cache_secret_key }}"
+          - --recursive
+          - "{{ item.stdout }}"
+      loop: "{{ built_profiles.results }}"
+      changed_when: true
+
+    - name: Publish every signed closure to the shared cache
+      ansible.builtin.command:
+        argv:
+          - "{{ nix_bin }}"
+          - copy
+          - --to
+          - "{{ cache_uri }}"
+          - "{{ item.stdout }}"
+      loop: "{{ built_profiles.results }}"
+      changed_when: true
+
+    - name: Report deployable profile coordinates
+      ansible.builtin.debug:
+        msg: "{{ dict(profiles | zip(built_profiles.results | map(attribute='stdout'))) }}"

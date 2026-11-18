@@ -1,0 +1,40 @@
+---
+- name: Roll back independent GPU stack profiles
+  hosts: gpu_nodes
+  serial: 1
+  gather_facts: false
+  vars:
+    nix_bin: /home/worker/.nix-profile/bin/nix
+    profile_root: /home/worker/.local/profiles/gpu-runtime
+    agent_socket: /home/worker/.local/state/gpu-runtime/agent.sock
+  pre_tasks:
+    - name: Read node activity before rollback
+      ansible.builtin.command:
+        argv: [curl, --fail, --silent, --show-error, --unix-socket, "{{ agent_socket }}", http://localhost/status]
+      register: node_status_raw
+      changed_when: false
+
+    - name: Decode node activity
+      ansible.builtin.set_fact:
+        node_status: "{{ node_status_raw.stdout | from_json }}"
+
+    - name: Refuse rollback over active work
+      ansible.builtin.assert:
+        that:
+          - >-
+            node_status.workloads.values()
+            | rejectattr('status', 'equalto', 'stopped')
+            | list | length == 0
+        fail_msg: Node has an active managed workload; no profile was changed.
+
+  tasks:
+    - name: Transactionally roll back only the requested profiles
+      ansible.builtin.command:
+        argv: "{{ ['/usr/bin/python3', '/home/worker/.local/libexec/gpu-platform/activate_profiles.py', '--root', profile_root, 'rollback'] + gpu_stack_rollback_profiles }}"
+      changed_when: true
+
+  post_tasks:
+    - name: Verify node-agent health after rollback
+      ansible.builtin.command:
+        argv: [curl, --fail, --silent, --show-error, --unix-socket, "{{ agent_socket }}", http://localhost/health]
+      changed_when: false

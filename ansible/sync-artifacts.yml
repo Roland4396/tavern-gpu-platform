@@ -1,0 +1,52 @@
+---
+- name: Converge shared GPU model assets without rebuilding runtime profiles
+  hosts: gpu_nodes
+  serial: 1
+  gather_facts: false
+  vars:
+    platform_controller: /home/worker/.local/libexec/gpu-platform
+    agent_socket: /home/worker/.local/state/gpu-runtime/agent.sock
+  pre_tasks:
+    - name: Read node activity without waking a workload
+      ansible.builtin.command:
+        argv: [curl, --fail, --silent, --show-error, --unix-socket, "{{ agent_socket }}", http://localhost/status]
+      register: node_status_raw
+      changed_when: false
+
+    - name: Refuse asset-link changes while Graph is active
+      ansible.builtin.assert:
+        that:
+          - (node_status_raw.stdout | from_json).workloads.graph.status == "stopped"
+        fail_msg: Graph is active; model assets were not changed.
+
+  tasks:
+    - name: Install the artifact manager
+      ansible.builtin.copy:
+        src: "../{{ item.src }}"
+        dest: "{{ platform_controller }}/{{ item.dest }}"
+        owner: worker
+        group: worker
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: artifact_sync.py, dest: artifact_sync.py, mode: "0700" }
+        - { src: artifacts.json, dest: artifacts.json, mode: "0600" }
+
+    - name: Download, verify, and link every declared asset
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - "{{ platform_controller }}/artifact_sync.py"
+          - --catalog
+          - "{{ platform_controller }}/artifacts.json"
+      register: artifact_sync
+      changed_when: "'\"changed\": true' in artifact_sync.stdout"
+
+    - name: Verify artifact convergence is idempotent
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - "{{ platform_controller }}/artifact_sync.py"
+          - --catalog
+          - "{{ platform_controller }}/artifacts.json"
+          - --check
+      changed_when: false
